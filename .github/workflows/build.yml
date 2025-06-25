@@ -1,0 +1,87 @@
+# based on https://github.com/DasAmpharos/EonTimer/blob/main/.github/workflows/build.yml
+name: Build
+
+on:
+  release:
+    types:
+      - published
+
+concurrency:
+  group: build-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os:
+          - macos-latest
+          - macos-13
+          - ubuntu-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install Dependencies (Ubuntu)
+        if: matrix.os == 'ubuntu'
+        run: | 
+          sudo apt update && sudo apt-get install -y python3-pyqt6 python3-dev libxcb-cursor0 
+
+      - name: Install Dependencies (macos)
+        if: matrix.os == 'macos'
+        run: brew install qt pyenv
+
+      - name: Install Dependencies 
+        run: pip install -r requirements.txt
+
+      - name: Build
+        run: pyinstaller SpotiDownloader.spec
+
+      - name: Get Artifact Name
+        id: artifact
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            hdiutil create -format UDZO -srcfolder dist/SpotiDownloader.app dist/SpotiDownloader-arm64.dmg
+            echo "artifact_name=SpotiDownloader-arm64.dmg" >> "$GITHUB_OUTPUT"
+            echo "artifact_archive_name=SpotiDownloader-${{ github.ref_name }}_mac-arm64" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ matrix.os }}" == "macos-13" ]]; then
+            hdiutil create -format UDZO -srcfolder dist/SpotiDownloader.app dist/SpotiDownloader-intel.dmg
+            echo "artifact_name=SpotiDownloader-intel.dmg" >> "$GITHUB_OUTPUT"
+            echo "artifact_archive_name=SpotiDownloader-${{ github.ref_name }}_mac-intel" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            echo "artifact_name=SpotiDownloader.exe" >> "$GITHUB_OUTPUT"
+            echo "artifact_archive_name=SpotiDownloader-${{ github.ref_name }}_windows-x64" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            echo "artifact_name=SpotiDownloader" >> "$GITHUB_OUTPUT"
+            echo "artifact_archive_name=SpotiDownloader-${{ github.ref_name }}_linux-x64" >> "$GITHUB_OUTPUT"
+          fi
+        
+      - name: Upload Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.artifact_archive_name }}.zip
+          path: dist/${{ steps.artifact.outputs.artifact_name }}
+
+      - name: Create Release Artifact
+        uses: vimtor/action-zip@v1.2
+        #if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/${{ steps.artifact.outputs.artifact_name }}
+          dest: dist/${{ steps.artifact.outputs.artifact_archive_name }}.zip
+          
+      - name: Upload Release Artifact
+        uses: softprops/action-gh-release@v2
+        #if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/${{ steps.artifact.outputs.artifact_archive_name }}.zip
+          
