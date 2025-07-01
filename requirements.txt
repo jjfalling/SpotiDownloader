@@ -4,3 +4,5 @@ requests
 PyQt6==6.9.1
 zendriver==0.8.1
 pyinstaller==6.14.1
+pyotp==2.9.0
+nodriver==0.46.1
