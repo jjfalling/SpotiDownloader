@@ -1,14 +1,6 @@
 import nodriver as uc
 import asyncio
 
-async def get_turnstile_token(page, max_attempts=20, check_interval=0.5):
-    for _ in range(max_attempts):
-        element = await page.query_selector('input[name="cf-turnstile-response"]')
-        if element and element.attrs and 'value' in element.attrs:
-            return element.attrs['value']
-        await asyncio.sleep(check_interval)
-    return None
-
 async def get_session_token(max_wait=30):
     browser = None
     try:
@@ -28,11 +20,8 @@ async def get_session_token(max_wait=30):
                     }
                     return response;
                 });
-            };
+            };        
         """)
-        
-        if not await get_turnstile_token(page):
-            return None
         
         await page.evaluate('document.querySelector("button.flex.justify-center.items-center.bg-button")?.click()')
         

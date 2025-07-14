@@ -104,6 +104,8 @@ class DownloadWorker(QThread):
     def get_formatted_filename(self, track):
         if self.filename_format == "artist_title":
             filename = f"{track.artists} - {track.title}.mp3"
+        elif self.filename_format == "title_only":
+            filename = f"{track.title}.mp3"
         else:
             filename = f"{track.title} - {track.artists}.mp3"
         return re.sub(r'[<>:"/\\|?*]', '_', filename)
@@ -310,7 +312,7 @@ class UpdateDialog(QDialog):
 class SpotiDownloaderGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.current_version = "4.4" 
+        self.current_version = "4.6" 
         self.tracks = []
         self.album_or_playlist_name = ''
         self.reset_state()
@@ -390,7 +392,7 @@ class SpotiDownloaderGUI(QWidget):
     def initUI(self):
         self.setWindowTitle('SpotiDownloader')
         self.setFixedWidth(650)
-        self.setFixedHeight(350)
+        self.setFixedHeight(370)
         
         icon_path = os.path.join(os.path.dirname(__file__), "icon.svg")
         if os.path.exists(icon_path):
@@ -633,17 +635,25 @@ class SpotiDownloaderGUI(QWidget):
         self.artist_title_radio.setCursor(Qt.CursorShape.PointingHandCursor)
         self.artist_title_radio.toggled.connect(self.save_filename_format)
         
+        self.title_only_radio = QRadioButton('Title')
+        self.title_only_radio.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.title_only_radio.toggled.connect(self.save_filename_format)
+        
         if hasattr(self, 'filename_format') and self.filename_format == "artist_title":
             self.artist_title_radio.setChecked(True)
+        elif hasattr(self, 'filename_format') and self.filename_format == "title_only":
+            self.title_only_radio.setChecked(True)
         else:
             self.title_artist_radio.setChecked(True)
         
         self.format_group.addButton(self.title_artist_radio)
         self.format_group.addButton(self.artist_title_radio)
+        self.format_group.addButton(self.title_only_radio)
         
         format_layout.addWidget(format_label)
         format_layout.addWidget(self.title_artist_radio)
         format_layout.addWidget(self.artist_title_radio)
+        format_layout.addWidget(self.title_only_radio)
         format_layout.addStretch()
         file_layout.addLayout(format_layout)
 
@@ -770,7 +780,7 @@ class SpotiDownloaderGUI(QWidget):
                 spacer = QSpacerItem(20, 6, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
                 about_layout.addItem(spacer)
 
-        footer_label = QLabel("v4.4 | July 2025")
+        footer_label = QLabel("v4.6 | July 2025")
         footer_label.setStyleSheet("font-size: 12px; margin-top: 10px;")
         about_layout.addWidget(footer_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
@@ -787,7 +797,12 @@ class SpotiDownloaderGUI(QWidget):
         self.log_output.append("Output path saved successfully!")
         
     def save_filename_format(self):
-        self.filename_format = "artist_title" if self.artist_title_radio.isChecked() else "title_artist"
+        if self.artist_title_radio.isChecked():
+            self.filename_format = "artist_title"
+        elif self.title_only_radio.isChecked():
+            self.filename_format = "title_only"
+        else:
+            self.filename_format = "title_artist"
         self.settings.setValue('filename_format', self.filename_format)
         self.settings.sync()
         
