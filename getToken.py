@@ -1,13 +1,20 @@
-import nodriver as uc
-import asyncio
+from CloudflareBypasser import CloudflareBypasser
+from DrissionPage import ChromiumPage
+import time
 
-async def get_session_token(max_wait=30):
-    browser = None
+def get_session_token_sync(max_wait=30):
+    page = None
     try:
-        browser = await uc.start(headless=False)
-        page = await browser.get("https://spotidownloader.com/")
+        page = ChromiumPage()
+        page.get("https://spotidownloader.com/")
         
-        await page.evaluate("""
+        bypasser = CloudflareBypasser(page, max_retries=3, log=True)
+        bypasser.bypass()
+        
+        if not bypasser.is_bypassed():
+            return None
+        
+        page.run_js("""
             window.originalFetch = window.fetch;
             window.sessionToken = null;
             window.fetch = function(...args) {
@@ -23,29 +30,29 @@ async def get_session_token(max_wait=30):
             };        
         """)
         
-        await page.evaluate('document.querySelector("button.flex.justify-center.items-center.bg-button")?.click()')
-        
         for _ in range(max_wait * 2):
-            token = await page.evaluate("window.sessionToken")
+            token = page.run_js("return window.sessionToken")
             if token:
                 return token
-            await asyncio.sleep(0.5)
+            time.sleep(0.5)
         
         return None
     except:
         return None
     finally:
-        if browser:
+        if page:
             try:
-                await browser.stop()
+                page.quit()
             except:
                 pass
 
 async def main():
-    token = await get_session_token()
-    if token:
-        print(token)
-    return token
+    return get_session_token_sync()
+
+def get_token():
+    return get_session_token_sync()
 
 if __name__ == "__main__":
-    uc.loop().run_until_complete(main())
+    token = get_token()
+    if token:
+        print(token)

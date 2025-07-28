@@ -2,10 +2,12 @@ import sys
 import os
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 import requests
 import re
 import asyncio
 from packaging import version
+import qdarktheme
 
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TRCK, TSRC, COMM
@@ -13,7 +15,7 @@ from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TRCK, TSRC, COMM
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
     QLabel, QFileDialog, QListWidget, QTextEdit, QTabWidget, QButtonGroup, QRadioButton,
-    QAbstractItemView, QSpacerItem, QSizePolicy, QProgressBar, QCheckBox, QDialog,
+    QAbstractItemView, QProgressBar, QCheckBox, QDialog,
     QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer, QTime, QSettings
@@ -108,7 +110,25 @@ class DownloadWorker(QThread):
             filename = f"{track.title}.mp3"
         else:
             filename = f"{track.title} - {track.artists}.mp3"
-        return re.sub(r'[<>:"/\\|?*]', '_', filename)
+        filename = re.sub(r'[<>:"/\\|?*]', lambda m: "'" if m.group() == '"' else '_', filename)
+        return filename
+
+    def is_valid_existing_file(self, filepath):
+        if not os.path.exists(filepath):
+            return False
+        
+        try:
+            file_size = os.path.getsize(filepath)
+            if file_size < 100000:  
+                return False
+            
+            audio = MP3(filepath)
+            if audio.info.length > 0:  
+                return True
+            else:
+                return False
+        except Exception:
+            return False
 
     def download_track(self, track):
         try:
@@ -126,8 +146,14 @@ class DownloadWorker(QThread):
         
             filepath = os.path.join(outpath, filename)
 
-            if os.path.exists(filepath):
+            if self.is_valid_existing_file(filepath):
                 return True, "File already exists - skipped"
+            
+            if os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except Exception as e:
+                    return False, f"Failed to remove corrupted file: {str(e)}"
 
             headers = {
                 'Host': 'api.spotidownloader.com',
@@ -165,10 +191,25 @@ class DownloadWorker(QThread):
             if audio_response.status_code != 200:
                 return False, f"Failed to download audio file. Status code: {audio_response.status_code}"
             
-            with open(filepath, "wb") as file:
-                file.write(audio_response.content)
-            
-            self.embed_metadata(filepath, track)
+            temp_filepath = filepath + ".tmp"
+            try:
+                with open(temp_filepath, "wb") as file:
+                    file.write(audio_response.content)
+                
+                if self.is_valid_existing_file(temp_filepath):
+                    os.rename(temp_filepath, filepath)
+                    self.embed_metadata(filepath, track)
+                else:
+                    if os.path.exists(temp_filepath):
+                        os.remove(temp_filepath)
+                    return False, "Downloaded file appears to be corrupted"
+            except Exception as e:
+                if os.path.exists(temp_filepath):
+                    try:
+                        os.remove(temp_filepath)
+                    except:
+                        pass
+                raise e
             
             return True, ""
         except requests.Timeout:
@@ -222,9 +263,34 @@ class DownloadWorker(QThread):
 
         audio.save()
 
+    def scan_existing_files(self):
+        existing_count = 0
+        for track in self.tracks:
+            filename = self.get_formatted_filename(track)
+            
+            if self.is_playlist and self.use_album_subfolders:
+                album_folder = re.sub(r'[<>:"/\\|?*]', '_', track.album)
+                outpath = os.path.join(self.outpath, album_folder)
+            else:
+                outpath = self.outpath
+
+            if (self.is_album or (self.is_playlist and self.use_album_subfolders)) and self.use_track_numbers:
+                filename = f"{track.track_number:02d} - {filename}"
+        
+            filepath = os.path.join(outpath, filename)
+            
+            if self.is_valid_existing_file(filepath):
+                existing_count += 1
+        
+        return existing_count
+
     def run(self):
         try:
             total_tracks = len(self.tracks)
+            
+            existing_count = self.scan_existing_files()
+            if existing_count > 0:
+                self.progress.emit(f"Found {existing_count} already downloaded tracks (will be skipped)", 0)
             
             for i, track in enumerate(self.tracks):
                 while self.is_paused:
@@ -272,31 +338,23 @@ class DownloadWorker(QThread):
         self.is_stopped = True
         self.is_paused = False
 
-
-
 class UpdateDialog(QDialog):
     def __init__(self, current_version, new_version, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Update Available")
+        self.setWindowTitle("Update Now")
         self.setFixedWidth(400)
         self.setModal(True)
 
         layout = QVBoxLayout()
 
-        message = QLabel(f"A new version of SpotiDownloader is available!\n\n"
-                        f"Current version: v{current_version}\n"
-                        f"New version: v{new_version}")
+        message = QLabel(f"SpotiDownloader v{new_version} Available!")
         message.setWordWrap(True)
         layout.addWidget(message)
 
-        self.disable_check = QCheckBox("Turn off update checking")
-        self.disable_check.setCursor(Qt.CursorShape.PointingHandCursor)
-        layout.addWidget(self.disable_check)
-
         button_box = QDialogButtonBox()
-        self.update_button = QPushButton("Update")
+        self.update_button = QPushButton("Check")
         self.update_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button = QPushButton("Later")
         self.cancel_button.setCursor(Qt.CursorShape.PointingHandCursor)
         
         button_box.addButton(self.update_button, QDialogButtonBox.ButtonRole.AcceptRole)
@@ -312,13 +370,14 @@ class UpdateDialog(QDialog):
 class SpotiDownloaderGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.current_version = "4.6" 
+        self.current_version = "4.9" 
         self.tracks = []
+        self.all_tracks = []  
         self.album_or_playlist_name = ''
         self.reset_state()
         
         self.settings = QSettings('SpotiDownloader', 'Settings')
-        self.last_output_path = self.settings.value('output_path', os.path.expanduser("~\\Music"))
+        self.last_output_path = self.settings.value('output_path', str(Path.home() / "Music"))
         self.last_url = self.settings.value('spotify_url', '')
         self.last_token = self.settings.value('spotify_token', '')
         self.filename_format = self.settings.value('filename_format', 'title_artist')
@@ -328,6 +387,7 @@ class SpotiDownloaderGUI(QWidget):
         self.check_for_updates = self.settings.value('check_for_updates', True, type=bool)
         self.token_fetch_mode = self.settings.value('token_fetch_mode', 'fast')
         self.token_refresh_interval = self.settings.value('token_refresh_interval', 60000, type=int)
+        self.current_theme_color = self.settings.value('theme_color', '#2196F3')
         
         self.elapsed_time = QTime(0, 0, 0)
         self.timer = QTimer(self)
@@ -355,10 +415,6 @@ class SpotiDownloaderGUI(QWidget):
                     dialog = UpdateDialog(self.current_version, new_version, self)
                     result = dialog.exec()
                     
-                    if dialog.disable_check.isChecked():
-                        self.settings.setValue('check_for_updates', False)
-                        self.check_for_updates = False
-                    
                     if result == QDialog.DialogCode.Accepted:
                         QDesktopServices.openUrl(QUrl("https://github.com/afkarxyz/SpotiDownloader/releases"))
                         
@@ -373,6 +429,7 @@ class SpotiDownloaderGUI(QWidget):
     
     def reset_state(self):
         self.tracks.clear()
+        self.all_tracks.clear()
         self.is_album = False
         self.is_playlist = False 
         self.is_single_track = False
@@ -388,11 +445,15 @@ class SpotiDownloaderGUI(QWidget):
         self.pause_resume_btn.setText('Pause')
         self.reset_info_widget()
         self.hide_track_buttons()
+        if hasattr(self, 'search_input'):
+            self.search_input.clear()
+        if hasattr(self, 'search_widget'):
+            self.search_widget.hide()
 
     def initUI(self):
         self.setWindowTitle('SpotiDownloader')
         self.setFixedWidth(650)
-        self.setFixedHeight(370)
+        self.setMinimumHeight(370)  
         
         icon_path = os.path.join(os.path.dirname(__file__), "icon.svg")
         if os.path.exists(icon_path):
@@ -413,12 +474,13 @@ class SpotiDownloaderGUI(QWidget):
         spotify_label.setFixedWidth(100)
         
         self.spotify_url = QLineEdit()
-        self.spotify_url.setPlaceholderText("Please enter the Spotify URL")
+        self.spotify_url.setPlaceholderText("Enter Spotify URL")
         self.spotify_url.setClearButtonEnabled(True)
         self.spotify_url.setText(self.last_url)
         self.spotify_url.textChanged.connect(self.save_url)
         
         self.fetch_btn = QPushButton('Fetch')
+        self.fetch_btn.setFixedWidth(80)
         self.fetch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.fetch_btn.clicked.connect(self.fetch_tracks)
         
@@ -433,12 +495,13 @@ class SpotiDownloaderGUI(QWidget):
         self.token_label.setObjectName('token_label')
         
         self.token_input = QLineEdit()
-        self.token_input.setPlaceholderText("Input your token here...")
+        self.token_input.setPlaceholderText("Enter Token")
         self.token_input.setText(self.last_token)
         self.token_input.textChanged.connect(self.save_token)
         self.token_input.setClearButtonEnabled(True)
         
         self.fetch_token_btn = QPushButton('Fetch')
+        self.fetch_token_btn.setFixedWidth(80)
         self.fetch_token_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.fetch_token_btn.clicked.connect(self.start_token_fetch)
         
@@ -449,6 +512,27 @@ class SpotiDownloaderGUI(QWidget):
         
         self.main_layout.addLayout(spotify_layout)
         
+    def filter_tracks(self):
+        search_text = self.search_input.text().lower().strip()
+        
+        if not search_text:
+            self.tracks = self.all_tracks.copy()
+        else:
+            self.tracks = [
+                track for track in self.all_tracks
+                if (search_text in track.title.lower() or 
+                    search_text in track.artists.lower() or 
+                    search_text in track.album.lower())
+            ]
+        
+        self.update_track_list_display()
+
+    def update_track_list_display(self):
+        self.track_list.clear()
+        for i, track in enumerate(self.tracks, 1):
+            duration = self.format_duration(track.duration_ms)
+            self.track_list.addItem(f"{i}. {track.title} - {track.artists} • {duration}")
+
     def browse_output(self):
         directory = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if directory:
@@ -462,6 +546,7 @@ class SpotiDownloaderGUI(QWidget):
         self.setup_dashboard_tab()
         self.setup_process_tab()
         self.setup_settings_tab()
+        self.setup_theme_tab()
         self.setup_about_tab()
 
     def setup_dashboard_tab(self):
@@ -477,6 +562,8 @@ class SpotiDownloaderGUI(QWidget):
         
         self.setup_track_buttons()
         dashboard_layout.addLayout(self.btn_layout)
+        
+        dashboard_layout.addWidget(self.single_track_container)
 
         dashboard_tab.setLayout(dashboard_layout)
         self.tab_widget.addTab(dashboard_tab, "Dashboard")
@@ -517,9 +604,36 @@ class SpotiDownloaderGUI(QWidget):
         text_info_layout.addStretch()
 
         info_layout.addLayout(text_info_layout, 1)
+        
+        self.setup_search_widget()
+        info_layout.addWidget(self.search_widget)
+        
         self.info_widget.setLayout(info_layout)
         self.info_widget.setFixedHeight(100)
         self.info_widget.hide()
+
+    def setup_search_widget(self):
+        self.search_widget = QWidget()
+        search_layout = QVBoxLayout()
+        search_layout.setContentsMargins(10, 0, 0, 0)
+        
+        search_layout.addStretch()
+        
+        search_input_layout = QHBoxLayout()
+        search_input_layout.addStretch()  
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search...")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self.filter_tracks)
+        self.search_input.setFixedWidth(250)  
+        
+        
+        search_input_layout.addWidget(self.search_input)
+        search_layout.addLayout(search_input_layout)
+        
+        self.search_widget.setLayout(search_layout)
+        self.search_widget.hide()  
 
     def setup_track_buttons(self):
         self.btn_layout = QHBoxLayout()
@@ -529,7 +643,7 @@ class SpotiDownloaderGUI(QWidget):
         self.clear_btn = QPushButton('Clear')
         
         for btn in [self.download_selected_btn, self.download_all_btn, self.remove_btn, self.clear_btn]:
-            btn.setFixedWidth(150)
+            btn.setMinimumWidth(120)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             
         self.download_selected_btn.clicked.connect(self.download_selected)
@@ -539,8 +653,32 @@ class SpotiDownloaderGUI(QWidget):
         
         self.btn_layout.addStretch()
         for btn in [self.download_selected_btn, self.download_all_btn, self.remove_btn, self.clear_btn]:
-            self.btn_layout.addWidget(btn)
+            self.btn_layout.addWidget(btn, 1)
         self.btn_layout.addStretch()
+
+        self.single_track_container = QWidget()
+        single_track_layout = QHBoxLayout(self.single_track_container)
+        single_track_layout.setContentsMargins(0, 0, 0, 0)
+        
+        single_track_layout.addStretch()
+        
+        self.single_download_btn = QPushButton('Download')
+        self.single_clear_btn = QPushButton('Clear')
+        
+        self.single_download_btn.setFixedWidth(120)
+        self.single_clear_btn.setFixedWidth(120)
+        
+        self.single_download_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.single_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+        self.single_download_btn.clicked.connect(self.download_all)
+        self.single_clear_btn.clicked.connect(self.clear_tracks)
+        
+        single_track_layout.addWidget(self.single_download_btn)
+        single_track_layout.addWidget(self.single_clear_btn)
+        single_track_layout.addStretch()
+        
+        self.single_track_container.hide()
 
     def setup_process_tab(self):
         self.process_tab = QWidget()
@@ -567,13 +705,19 @@ class SpotiDownloaderGUI(QWidget):
         self.stop_btn = QPushButton('Stop')
         self.pause_resume_btn = QPushButton('Pause')
         
+        self.stop_btn.setFixedWidth(120)
+        self.pause_resume_btn.setFixedWidth(120)
+        
         self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.pause_resume_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         
         self.stop_btn.clicked.connect(self.stop_download)
         self.pause_resume_btn.clicked.connect(self.toggle_pause_resume)
+        
+        control_layout.addStretch()
         control_layout.addWidget(self.stop_btn)
         control_layout.addWidget(self.pause_resume_btn)
+        control_layout.addStretch()
         
         process_layout.addLayout(control_layout)
         
@@ -606,6 +750,7 @@ class SpotiDownloaderGUI(QWidget):
         self.output_dir.textChanged.connect(self.save_output_path)
         
         self.output_browse = QPushButton('Browse')
+        self.output_browse.setFixedWidth(80)
         self.output_browse.setCursor(Qt.CursorShape.PointingHandCursor)
         self.output_browse.clicked.connect(self.browse_output)
         
@@ -730,19 +875,190 @@ class SpotiDownloaderGUI(QWidget):
         settings_tab.setLayout(settings_layout)
         self.tab_widget.addTab(settings_tab, "Settings")
         
+    def setup_theme_tab(self):
+        theme_tab = QWidget()
+        theme_layout = QVBoxLayout()
+        theme_layout.setSpacing(8)
+        theme_layout.setContentsMargins(15, 15, 15, 15)
+
+        grid_layout = QVBoxLayout()
+        
+        self.color_buttons = {}
+        
+        first_row_palettes = [
+            ("Red", [
+                ("#FFCDD2", "100"), ("#EF9A9A", "200"), ("#E57373", "300"), ("#EF5350", "400"), ("#F44336", "500"), ("#E53935", "600"), ("#D32F2F", "700"), ("#C62828", "800"), ("#B71C1C", "900"), ("#FF8A80", "A100"), ("#FF5252", "A200"), ("#FF1744", "A400"), ("#D50000", "A700")
+            ]),
+            ("Pink", [
+                ("#F8BBD0", "100"), ("#F48FB1", "200"), ("#F06292", "300"), ("#EC407A", "400"), ("#E91E63", "500"), ("#D81B60", "600"), ("#C2185B", "700"), ("#AD1457", "800"), ("#880E4F", "900"), ("#FF80AB", "A100"), ("#FF4081", "A200"), ("#F50057", "A400"), ("#C51162", "A700")
+            ]),
+            ("Purple", [
+                ("#E1BEE7", "100"), ("#CE93D8", "200"), ("#BA68C8", "300"), ("#AB47BC", "400"), ("#9C27B0", "500"), ("#8E24AA", "600"), ("#7B1FA2", "700"), ("#6A1B9A", "800"), ("#4A148C", "900"), ("#EA80FC", "A100"), ("#E040FB", "A200"), ("#D500F9", "A400"), ("#AA00FF", "A700")
+            ])
+        ]
+        
+        second_row_palettes = [
+            ("Deep Purple", [
+                ("#D1C4E9", "100"), ("#B39DDB", "200"), ("#9575CD", "300"), ("#7E57C2", "400"), ("#673AB7", "500"), ("#5E35B1", "600"), ("#512DA8", "700"), ("#4527A0", "800"), ("#311B92", "900"), ("#B388FF", "A100"), ("#7C4DFF", "A200"), ("#651FFF", "A400"), ("#6200EA", "A700")
+            ]),
+            ("Indigo", [
+                ("#C5CAE9", "100"), ("#9FA8DA", "200"), ("#7986CB", "300"), ("#5C6BC0", "400"), ("#3F51B5", "500"), ("#3949AB", "600"), ("#303F9F", "700"), ("#283593", "800"), ("#1A237E", "900"), ("#8C9EFF", "A100"), ("#536DFE", "A200"), ("#3D5AFE", "A400"), ("#304FFE", "A700")
+            ]),
+            ("Blue", [
+                ("#BBDEFB", "100"), ("#90CAF9", "200"), ("#64B5F6", "300"), ("#42A5F5", "400"), ("#2196F3", "500"), ("#1E88E5", "600"), ("#1976D2", "700"), ("#1565C0", "800"), ("#0D47A1", "900"), ("#82B1FF", "A100"), ("#448AFF", "A200"), ("#2979FF", "A400"), ("#2962FF", "A700")
+            ])
+        ]
+        
+        third_row_palettes = [
+            ("Light Blue", [
+                ("#B3E5FC", "100"), ("#81D4FA", "200"), ("#4FC3F7", "300"), ("#29B6F6", "400"), ("#03A9F4", "500"), ("#039BE5", "600"), ("#0288D1", "700"), ("#0277BD", "800"), ("#01579B", "900"), ("#80D8FF", "A100"), ("#40C4FF", "A200"), ("#00B0FF", "A400"), ("#0091EA", "A700")
+            ]),
+            ("Cyan", [
+                ("#B2EBF2", "100"), ("#80DEEA", "200"), ("#4DD0E1", "300"), ("#26C6DA", "400"), ("#00BCD4", "500"), ("#00ACC1", "600"), ("#0097A7", "700"), ("#00838F", "800"), ("#006064", "900"), ("#84FFFF", "A100"), ("#18FFFF", "A200"), ("#00E5FF", "A400"), ("#00B8D4", "A700")
+            ]),
+            ("Teal", [
+                ("#B2DFDB", "100"), ("#80CBC4", "200"), ("#4DB6AC", "300"), ("#26A69A", "400"), ("#009688", "500"), ("#00897B", "600"), ("#00796B", "700"), ("#00695C", "800"), ("#004D40", "900"), ("#A7FFEB", "A100"), ("#64FFDA", "A200"), ("#1DE9B6", "A400"), ("#00BFA5", "A700")
+            ])
+        ]
+        
+        fourth_row_palettes = [
+            ("Green", [
+                ("#C8E6C9", "100"), ("#A5D6A7", "200"), ("#81C784", "300"), ("#66BB6A", "400"), ("#4CAF50", "500"), ("#43A047", "600"), ("#388E3C", "700"), ("#2E7D32", "800"), ("#1B5E20", "900"), ("#B9F6CA", "A100"), ("#69F0AE", "A200"), ("#00E676", "A400"), ("#00C853", "A700")
+            ]),
+            ("Light Green", [
+                ("#DCEDC8", "100"), ("#C5E1A5", "200"), ("#AED581", "300"), ("#9CCC65", "400"), ("#8BC34A", "500"), ("#7CB342", "600"), ("#689F38", "700"), ("#558B2F", "800"), ("#33691E", "900"), ("#CCFF90", "A100"), ("#B2FF59", "A200"), ("#76FF03", "A400"), ("#64DD17", "A700")
+            ]),
+            ("Lime", [
+                ("#F0F4C3", "100"), ("#E6EE9C", "200"), ("#DCE775", "300"), ("#D4E157", "400"), ("#CDDC39", "500"), ("#C0CA33", "600"), ("#AFB42B", "700"), ("#9E9D24", "800"), ("#827717", "900"), ("#F4FF81", "A100"), ("#EEFF41", "A200"), ("#C6FF00", "A400"), ("#AEEA00", "A700")
+            ])
+        ]
+        
+        fifth_row_palettes = [
+            ("Yellow", [
+                ("#FFF9C4", "100"), ("#FFF59D", "200"), ("#FFF176", "300"), ("#FFEE58", "400"), ("#FFEB3B", "500"), ("#FDD835", "600"), ("#FBC02D", "700"), ("#F9A825", "800"), ("#F57F17", "900"), ("#FFFF8D", "A100"), ("#FFFF00", "A200"), ("#FFEA00", "A400"), ("#FFD600", "A700")
+            ]),
+            ("Amber", [
+                ("#FFECB3", "100"), ("#FFE082", "200"), ("#FFD54F", "300"), ("#FFCA28", "400"), ("#FFC107", "500"), ("#FFB300", "600"), ("#FFA000", "700"), ("#FF8F00", "800"), ("#FF6F00", "900"), ("#FFE57F", "A100"), ("#FFD740", "A200"), ("#FFC400", "A400"), ("#FFAB00", "A700")
+            ]),
+            ("Orange", [
+                ("#FFE0B2", "100"), ("#FFCC80", "200"), ("#FFB74D", "300"), ("#FFA726", "400"), ("#FF9800", "500"), ("#FB8C00", "600"), ("#F57C00", "700"), ("#EF6C00", "800"), ("#E65100", "900"), ("#FFD180", "A100"), ("#FFAB40", "A200"), ("#FF9100", "A400"), ("#FF6D00", "A700")
+            ])
+        ]
+        
+        for row_palettes in [first_row_palettes, second_row_palettes, third_row_palettes, fourth_row_palettes, fifth_row_palettes]:
+            row_layout = QHBoxLayout()
+            row_layout.setSpacing(15)
+            
+            for palette_name, colors in row_palettes:
+                column_layout = QVBoxLayout()
+                column_layout.setSpacing(3)
+                
+                palette_label = QLabel(palette_name)
+                palette_label.setStyleSheet("margin-bottom: 2px;")
+                palette_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                column_layout.addWidget(palette_label)
+                
+                color_buttons_layout = QHBoxLayout()
+                color_buttons_layout.setSpacing(3)
+                
+                for color_hex, color_name in colors:
+                    color_btn = QPushButton()
+                    color_btn.setFixedSize(18, 18)
+                    
+                    is_current = color_hex == self.current_theme_color
+                    border_style = "2px solid #fff" if is_current else "none"
+                    
+                    color_btn.setStyleSheet(f"""
+                        QPushButton {{
+                            background-color: {color_hex};
+                            border: {border_style};
+                            border-radius: 9px;
+                        }}
+                        QPushButton:hover {{
+                            border: 2px solid #fff;
+                        }}
+                        QPushButton:pressed {{
+                            border: 2px solid #fff;
+                        }}
+                    """)
+                    color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    color_btn.setToolTip(f"{palette_name} {color_name}\n{color_hex}")
+                    color_btn.clicked.connect(lambda checked, color=color_hex, btn=color_btn: self.change_theme_color(color, btn))
+                    
+                    self.color_buttons[color_hex] = color_btn
+                    
+                    color_buttons_layout.addWidget(color_btn)
+                
+                column_layout.addLayout(color_buttons_layout)
+                row_layout.addLayout(column_layout)
+            
+            grid_layout.addLayout(row_layout)
+
+        theme_layout.addLayout(grid_layout)
+        theme_layout.addStretch()
+
+        theme_tab.setLayout(theme_layout)
+        self.tab_widget.addTab(theme_tab, "Theme")
+
+    def change_theme_color(self, color, clicked_btn=None):
+        if hasattr(self, 'color_buttons'):
+            for color_hex, btn in self.color_buttons.items():
+                if color_hex == self.current_theme_color:
+                    btn.setStyleSheet(f"""
+                        QPushButton {{
+                            background-color: {color_hex};
+                            border: none;
+                            border-radius: 9px;
+                        }}
+                        QPushButton:hover {{
+                            border: 2px solid #fff;
+                        }}
+                        QPushButton:pressed {{
+                            border: 2px solid #fff;
+                        }}
+                    """)
+                    break
+        
+        self.current_theme_color = color
+        self.settings.setValue('theme_color', color)
+        self.settings.sync()
+        
+        if clicked_btn:
+            clicked_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {color};
+                    border: 2px solid #fff;
+                    border-radius: 9px;
+                }}
+                QPushButton:hover {{
+                    border: 2px solid #fff;
+                }}
+                QPushButton:pressed {{
+                    border: 2px solid #fff;
+                }}
+            """)
+        
+        qdarktheme.setup_theme(
+            custom_colors={
+                "[dark]": {
+                    "primary": color,
+                }
+            }
+        )
+        
     def setup_about_tab(self):
         about_tab = QWidget()
         about_layout = QVBoxLayout()
         about_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        about_layout.setSpacing(3)
+        about_layout.setSpacing(15)
 
         sections = [
-            ("Check for Updates", "https://github.com/afkarxyz/SpotiDownloader/releases"),
-            ("Report an Issue", "https://github.com/afkarxyz/SpotiDownloader/issues"),
-            ("SpotiDownloader Site", "spotidownloader.com")
+            ("Check for Updates", "Check", "https://github.com/afkarxyz/SpotiDownloader/releases"),
+            ("Report an Issue", "Report", "https://github.com/afkarxyz/SpotiDownloader/issues"),
+            ("SpotiDownloader Site", "Visit", "spotidownloader.com")
         ]
 
-        for title, url in sections:
+        for title, button_text, url in sections:
             section_widget = QWidget()
             section_layout = QVBoxLayout(section_widget)
             section_layout.setSpacing(10)
@@ -753,35 +1069,16 @@ class SpotiDownloaderGUI(QWidget):
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             section_layout.addWidget(label)
 
-            button = QPushButton("Click Here!")
-            button.setFixedWidth(150)
-            button.setStyleSheet("""
-                QPushButton {
-                    background-color: palette(button);
-                    color: palette(button-text);
-                    border: 1px solid palette(mid);
-                    padding: 6px;
-                    border-radius: 15px;
-                }
-                QPushButton:hover {
-                    background-color: palette(light);
-                }
-                QPushButton:pressed {
-                    background-color: palette(midlight);
-                }
-            """)
+            button = QPushButton(button_text)
+            button.setFixedSize(120, 25)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(lambda _, url=url: QDesktopServices.openUrl(QUrl(url if url.startswith(('http://', 'https://')) else f'https://{url}')))
             section_layout.addWidget(button, alignment=Qt.AlignmentFlag.AlignCenter)
 
             about_layout.addWidget(section_widget)
 
-            if sections.index((title, url)) < len(sections) - 1:
-                spacer = QSpacerItem(20, 6, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-                about_layout.addItem(spacer)
-
-        footer_label = QLabel("v4.6 | July 2025")
-        footer_label.setStyleSheet("font-size: 12px; margin-top: 10px;")
+        footer_label = QLabel(f"v{self.current_version} | July 2025")
+        footer_label.setStyleSheet("font-size: 12px; margin-top: 20px;")
         about_layout.addWidget(footer_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
         about_tab.setLayout(about_layout)
@@ -967,7 +1264,7 @@ class SpotiDownloaderGUI(QWidget):
         self.fetch_btn.setEnabled(True)
 
     def handle_track_metadata(self, track_data):
-        self.tracks = [Track(
+        track = Track(
             id=track_data["id"],
             title=track_data["name"],
             artists=track_data["artists"],
@@ -977,7 +1274,10 @@ class SpotiDownloaderGUI(QWidget):
             isrc=track_data.get("isrc", ""),
             image_url=track_data.get("images", ""),
             release_date=track_data.get("release_date", "")
-        )]
+        )
+        
+        self.tracks = [track]
+        self.all_tracks = [track]
         self.is_single_track = True
         self.is_album = self.is_playlist = False
         self.album_or_playlist_name = f"{self.tracks[0].title} - {self.tracks[0].artists}"
@@ -1008,7 +1308,8 @@ class SpotiDownloaderGUI(QWidget):
                 image_url=track.get("images", ""),
                 release_date=track.get("release_date", "")
             ))
-            
+        
+        self.all_tracks = self.tracks.copy()
         self.is_album = True
         self.is_playlist = self.is_single_track = False
         
@@ -1038,7 +1339,8 @@ class SpotiDownloaderGUI(QWidget):
                 image_url=track.get("images", ""),
                 release_date=track.get("release_date", "")
             ))
-            
+        
+        self.all_tracks = self.tracks.copy()
         self.is_playlist = True
         self.is_album = self.is_single_track = False
         
@@ -1055,10 +1357,10 @@ class SpotiDownloaderGUI(QWidget):
         self.track_list.setVisible(not self.is_single_track)
         
         if not self.is_single_track:
-            self.track_list.clear()
-            for i, track in enumerate(self.tracks, 1):
-                duration = self.format_duration(track.duration_ms)
-                self.track_list.addItem(f"{i}. {track.title} - {track.artists} • {duration}")
+            self.search_widget.show()
+            self.update_track_list_display()
+        else:
+            self.search_widget.hide()
         
         self.update_info_widget(metadata)
 
@@ -1130,21 +1432,30 @@ class SpotiDownloaderGUI(QWidget):
 
     def update_button_states(self):
         if self.is_single_track:
-            self.download_selected_btn.hide()
-            self.remove_btn.hide()
-            self.download_all_btn.setText('Download')
-            self.clear_btn.setText('Clear')
+            for btn in [self.download_selected_btn, self.download_all_btn, self.remove_btn, self.clear_btn]:
+                btn.hide()
+            
+            self.single_track_container.show()
+            
+            self.single_download_btn.setEnabled(True)
+            self.single_clear_btn.setEnabled(True)
+            
         else:
+            self.single_track_container.hide()
+            
             self.download_selected_btn.show()
+            self.download_all_btn.show()
             self.remove_btn.show()
+            self.clear_btn.show()
+            
             self.download_all_btn.setText('Download All')
             self.clear_btn.setText('Clear')
-        
-        self.download_all_btn.show()
-        self.clear_btn.show()
-        
-        self.download_selected_btn.setEnabled(True)
-        self.download_all_btn.setEnabled(True)
+            
+            self.download_all_btn.setMinimumWidth(120)
+            self.clear_btn.setMinimumWidth(120)
+            
+            self.download_selected_btn.setEnabled(True)
+            self.download_all_btn.setEnabled(True)
 
     def hide_track_buttons(self):
         buttons = [
@@ -1155,6 +1466,9 @@ class SpotiDownloaderGUI(QWidget):
         ]
         for btn in buttons:
             btn.hide()
+        
+        if hasattr(self, 'single_track_container'):
+            self.single_track_container.hide()
 
     def download_selected(self):
         if self.is_single_track:
@@ -1164,13 +1478,14 @@ class SpotiDownloaderGUI(QWidget):
             if not selected_items:
                 self.log_output.append('Warning: Please select tracks to download.')
                 return
-            self.download_tracks([self.track_list.row(item) for item in selected_items])
+            selected_indices = [self.track_list.row(item) for item in selected_items]
+            self.download_tracks(selected_indices)
 
     def download_all(self):
         if self.is_single_track:
             self.download_tracks([0])
         else:
-            self.download_tracks(range(self.track_list.count()))
+            self.download_tracks(range(len(self.tracks)))
 
     def download_tracks(self, indices):
         self.log_output.clear()
@@ -1221,6 +1536,12 @@ class SpotiDownloaderGUI(QWidget):
     def update_ui_for_download_start(self):
         self.download_selected_btn.setEnabled(False)
         self.download_all_btn.setEnabled(False)
+        
+        if hasattr(self, 'single_download_btn'):
+            self.single_download_btn.setEnabled(False)
+        if hasattr(self, 'single_clear_btn'):
+            self.single_clear_btn.setEnabled(False)
+            
         self.stop_btn.show()
         self.pause_resume_btn.show()
         self.progress_bar.show()
@@ -1253,6 +1574,11 @@ class SpotiDownloaderGUI(QWidget):
         self.download_selected_btn.setEnabled(True)
         self.download_all_btn.setEnabled(True)
         
+        if hasattr(self, 'single_download_btn'):
+            self.single_download_btn.setEnabled(True)
+        if hasattr(self, 'single_clear_btn'):
+            self.single_clear_btn.setEnabled(True)
+        
         if success:
             self.log_output.append(f"\nStatus: {message}")
             if failed_tracks:
@@ -1277,21 +1603,22 @@ class SpotiDownloaderGUI(QWidget):
 
     def remove_selected_tracks(self):
         if not self.is_single_track:
-            selected_indices = sorted([self.track_list.row(item) for item in self.track_list.selectedItems()], reverse=True)
+            selected_items = self.track_list.selectedItems()
+            selected_indices = [self.track_list.row(item) for item in selected_items]
             
-            for index in selected_indices:
-                self.track_list.takeItem(index)
-                self.tracks.pop(index)
+            tracks_to_remove = [self.tracks[i] for i in selected_indices]
             
-            for i, track in enumerate(self.tracks, 1):
-                if self.is_playlist:
+            for track in tracks_to_remove:
+                if track in self.tracks:
+                    self.tracks.remove(track)
+                if track in self.all_tracks:
+                    self.all_tracks.remove(track)
+            
+            if self.is_playlist:
+                for i, track in enumerate(self.all_tracks, 1):
                     track.track_number = i
-                
-                duration = self.format_duration(track.duration_ms)
-                display_text = f"{i}. {track.title} - {track.artists} • {duration}"
-                list_item = self.track_list.item(i - 1)
-                if list_item:
-                    list_item.setText(display_text)
+            
+            self.update_track_list_display()
 
     def clear_tracks(self):
         self.reset_state()
@@ -1314,6 +1641,17 @@ class SpotiDownloaderGUI(QWidget):
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    
+    settings = QSettings('SpotiDownloader', 'Settings')
+    theme_color = settings.value('theme_color', '#2196F3')
+    
+    qdarktheme.setup_theme(
+        custom_colors={
+            "[dark]": {
+                "primary": theme_color,
+            }
+        }
+    )
     ex = SpotiDownloaderGUI()
     ex.show()
     sys.exit(app.exec())
